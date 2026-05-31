@@ -1,0 +1,166 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * Core Philosophy: This ruleset implements a Database-Based Access Control (DBAC) model.
+     * A user's role (Admin, Judge) is determined by the existence of a corresponding document in the
+     * `/admins/{userId}` or `/judges/{userId}` collections. This approach centralizes role management
+     * and avoids complex, slow `get()` calls for authorization in most rules.
+     *
+     * Data Structure: The data is organized into flat, top-level collections (e.g., /candidates, /scores).
+     * There are no nested user-specific subcollections. This simplifies queries and rules logic.
+     *
+     * Key Security Decisions:
+     * - Admin-Only Writes: Most data critical to the event (candidates, categories, settings) can only
+     *   be modified by administrators, ensuring data integrity.
+     * - Public Read for Signed-In Users: Core event data is readable by any authenticated user,
+     *   allowing the application to function for judges and potentially viewers, while preventing
+     *   unauthenticated abuse.
+     * - Immutable Scores: Judges can create scores, but cannot update or delete them. This creates
+     *   a secure, auditable trail of scoring. Only admins have the power to delete scores if needed.
+     * - Default Deny: All operations are denied by default unless explicitly permitted.
+     *
+     * Denormalization for Authorization: The core of the security model relies on the `/admins/{uid}` and
+     * `/judges/{uid}` collections. The existence of a document in these collections grants a user
+     * their respective role, which is checked by the `isAdmin()` and `isActiveJudge()` helper functions.
+     * This is a deliberate denormalization strategy to make role checks fast and efficient.
+     *
+     * Structural Segregation: Role-defining data (`admins`, `judges`) is stored in separate collections
+     * from operational data (`scores`, `candidates`), leading to cleaner, more focused security rules for
+     * each collection.
+     */
+
+    // --------------------------------
+    // Helper Functions
+    // --------------------------------
+
+    /**
+     * Returns true if the user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Returns true if the requesting user has a document in the /admins collection,
+     * granting them administrator privileges.
+     */
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    /**
+     * Returns true if the requesting user has a document in the /judges collection
+     * AND their status is marked as active. Uses get() to inspect document data.
+     */
+    function isActiveJudge() {
+      return isSignedIn() && get(/databases/$(database)/documents/judges/$(request.auth.uid)).data.isActive == true;
+    }
+
+    // --------------------------------
+    // Collection Rules
+    // --------------------------------
+
+    /**
+     * @description Controls access to event-wide settings.
+     * @path /settings/{eventId}
+     * @allow (get) A signed-in judge reads the event settings.
+     * @deny (create) A non-admin user attempts to create new settings.
+     * @principle Public read for authenticated users, with admin-only write control.
+     */
+    match /settings/{eventId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    /**
+     * @description Manages administrator role documents.
+     * @path /admins/{adminId}
+     * @allow (create) An existing admin adds a new administrator, or the initial super-admin creates their own record.
+     * @deny (list) A non-admin user attempts to list all administrators.
+     * @principle Restricts most access to admins, with an exception for bootstrapping the first admin.
+     */
+    match /admins/{adminId} {
+      allow get: if isAdmin() || request.auth.uid == adminId;
+      allow list: if isAdmin();
+      allow create: if (isAdmin() || request.auth.token.email == 'admin@pageant.pro') && request.resource.data.adminId == adminId;
+      allow update: if isAdmin() && resource != null && request.resource.data.adminId == resource.data.adminId;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Manages judge role documents.
+     * @path /judges/{judgeId}
+     * @allow (list) An authenticated user lists all judges for display.
+     * @deny (create) A judge attempts to add another judge.
+     * @principle Public read for authenticated users, with admin-only write control.
+     */
+    match /judges/{judgeId} {
+      allow get, list: if isSignedIn();
+      allow create: if isAdmin() && request.resource.data.judgeId == judgeId;
+      allow update: if isAdmin() && resource != null && request.resource.data.judgeId == resource.data.judgeId;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Manages candidate information.
+     * @path /candidates/{candidateId}
+     * @allow (list) A signed-in user or judge views the list of candidates.
+     * @deny (create) A judge attempts to add a new candidate.
+     * @principle Public read for authenticated users, with admin-only write control.
+     */
+    match /candidates/{candidateId} {
+      allow get, list: if isSignedIn();
+      allow create: if isAdmin() && request.resource.data.candidateId == candidateId;
+      allow update: if isAdmin() && resource != null && request.resource.data.candidateId == resource.data.candidateId;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Manages scoring categories.
+     * @path /categories/{categoryId}
+     * @allow (get) A judge reads the details of a scoring category.
+     * @deny (update) A judge attempts to rename a category.
+     * @principle Public read for authenticated users, with admin-only write control.
+     */
+    match /categories/{categoryId} {
+      allow get, list: if isSignedIn();
+      allow create: if isAdmin() && request.resource.data.categoryId == categoryId;
+      allow update: if isAdmin() && resource != null && request.resource.data.categoryId == resource.data.categoryId;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Manages scoring criteria for each category.
+     * @path /criteria/{categoryId}
+     * @allow (get) A judge reads the criteria for a category before scoring.
+     * @deny (create) A non-admin tries to define new criteria.
+     * @principle Public read for authenticated users, with admin-only write control.
+     */
+    match /criteria/{categoryId} {
+      allow get, list: if isSignedIn();
+      allow create: if isAdmin() && request.resource.data.categoryId == categoryId;
+      allow update: if isAdmin() && resource != null && request.resource.data.categoryId == resource.data.categoryId;
+      allow delete: if isAdmin() && resource != null;
+    }
+
+    /**
+     * @description Secures individual score submissions from judges.
+     * @path /scores/{scoreId}
+     * @allow (create) An active judge submits a score where the score's `judgeId` matches their own UID.
+     * @deny (update) A judge attempts to change their submitted score.
+     * @deny (delete) A judge attempts to delete their own score.
+     * @deny (create) An admin attempts to create a score on behalf of a judge.
+     * @principle Enforces that active judges can only create their own scores, which are then immutable. Only admins can perform destructive actions.
+     */
+    match /scores/{scoreId} {
+      allow get: if isAdmin() || (isActiveJudge() && resource.data.judgeId == request.auth.uid);
+      allow list: if isAdmin();
+      allow create: if isActiveJudge() && request.resource.data.judgeId == request.auth.uid;
+      allow update: if false;
+      allow delete: if isAdmin() && resource != null;
+    }
+  }
+}
